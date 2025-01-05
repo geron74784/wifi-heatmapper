@@ -1,11 +1,13 @@
-import { ScannerSettings, WifiNetwork } from "./types";
-import { execAsync } from "./server-utils";
+import { exec } from "child_process";
+import util from "util";
+import { WifiNetwork } from "./types";
+
+const execAsync = util.promisify(exec);
 
 const getDefaultWifiNetwork = (): WifiNetwork => ({
   ssid: "",
   bssid: "",
   rssi: 0,
-  signalStrength: 0,
   channel: 0,
   frequency: 0,
   channelWidth: 0,
@@ -14,32 +16,19 @@ const getDefaultWifiNetwork = (): WifiNetwork => ({
   security: "",
 });
 
-const hasValidData = (wifiData: WifiNetwork): boolean => {
-  return (
-    wifiData.ssid !== "" &&
-    isValidMacAddress(wifiData.bssid) &&
-    // either rssi or signalStrength must be non-zero
-    (wifiData.rssi !== 0 || wifiData.signalStrength !== 0)
-  );
-};
-
 /**
  * Gets the current WiFi network name, BSSID of the AP it's connected to, and the RSSI.
  */
-export async function scanWifi(
-  settings: ScannerSettings
-): Promise<WifiNetwork> {
-  let wifiData: WifiNetwork | null = null;
-
+export async function scanWifi(sudoerPassword: string): Promise<WifiNetwork> {
   try {
     const platform = process.platform;
 
     if (platform === "darwin") {
-      wifiData = await scanWifiMacOS(settings);
+      // macOS
+      return await scanWifiMacOS(sudoerPassword);
     } else if (platform === "win32") {
-      wifiData = await scanWifiWindows();
-    } else if (platform === "linux") {
-      wifiData = await scanWifiLinux(settings);
+      // Windows
+      return await scanWifiWindows();
     } else {
       throw new Error(`Unsupported platform: ${platform}`);
     }
@@ -53,59 +42,27 @@ export async function scanWifi(
     }
     throw error;
   }
-
-  if (!hasValidData(wifiData)) {
-    throw new Error(
-      "Measurement failed. We were not able to get good enough WiFi data: " +
-        JSON.stringify(wifiData)
-    );
-  }
-
-  return wifiData;
 }
 
-const normalizeMacAddress = (macAddress: string): string => {
-  return macAddress.replace(/[:-]/g, "").toLowerCase();
-};
-
-const isValidMacAddress = (macAddress: string): boolean => {
-  const cleanedMacAddress = normalizeMacAddress(macAddress);
-  return /^[0-9a-f]{12}$/.test(cleanedMacAddress);
-};
-
-const getIoregSsid = async (): Promise<string> => {
-  const { stdout } = await execAsync(
-    "ioreg -l -n AirPortDriver | grep IO80211SSID | sed 's/^.*= \"\\(.*\\)\".*$/\\1/; s/ /_/g'"
-  );
-  return stdout.trim();
-};
-
-const getIoregBssid = async (): Promise<string> => {
-  const { stdout } = await execAsync(
-    "ioreg -l | grep \"IO80211BSSID\" | awk -F' = ' '{print $2}' | sed 's/[<>]//g'"
-  );
-  return stdout.trim();
-};
-
 export async function scanWifiMacOS(
-  settings: ScannerSettings
+  sudoerPassword: string
 ): Promise<WifiNetwork> {
-  const wdutilOutput = await execAsync(
-    `echo ${settings.sudoerPassword} | sudo -S wdutil info`
-  );
-  const wdutilNetworkInfo = parseWdutilOutput(wdutilOutput.stdout);
+  const [wdutilOutput, ssid, bssid] = await Promise.all([
+    execAsync(`echo ${sudoerPassword} | sudo -S wdutil info`),
+    execAsync(
+      "ioreg -l -n AirPortDriver | grep IO80211SSID | sed 's/^.*= \"\\(.*\\)\".*$/\\1/; s/ /_/g'"
+    ),
+    execAsync(
+      "ioreg -l | grep \"IO80211BSSID\" | awk -F' = ' '{print $2}' | sed 's/[<>]//g'"
+    ),
+  ]);
 
-  if (!isValidMacAddress(wdutilNetworkInfo.bssid)) {
-    const ssidOutput = await getIoregSsid();
-    wdutilNetworkInfo.ssid = ssidOutput;
-  }
+  const network = parseWdutilOutput(wdutilOutput.stdout);
 
-  if (!isValidMacAddress(wdutilNetworkInfo.bssid)) {
-    const bssidOutput = await getIoregBssid();
-    wdutilNetworkInfo.bssid = bssidOutput;
-  }
+  network.ssid = ssid.stdout.trim();
+  network.bssid = bssid.stdout.trim();
 
-  return wdutilNetworkInfo;
+  return network;
 }
 
 async function scanWifiWindows(): Promise<WifiNetwork> {
@@ -113,27 +70,6 @@ async function scanWifiWindows(): Promise<WifiNetwork> {
   const { stdout } = await execAsync(command);
 
   return parseNetshOutput(stdout);
-}
-
-async function iwDevLink(interfaceId: string): Promise<string> {
-  const command = `iw dev ${interfaceId} link`;
-  const { stdout } = await execAsync(command);
-  return stdout;
-}
-
-async function iwDevInfo(interfaceId: string): Promise<string> {
-  const command = `iw dev ${interfaceId} info`;
-  const { stdout } = await execAsync(command);
-  return stdout;
-}
-
-async function scanWifiLinux(settings: ScannerSettings): Promise<WifiNetwork> {
-  const [linkOutput, infoOutput] = await Promise.all([
-    iwDevLink(settings.wlanInterfaceId),
-    iwDevInfo(settings.wlanInterfaceId),
-  ]);
-
-  return parseIwOutput(linkOutput, infoOutput);
 }
 
 export function parseWdutilOutput(output: string): WifiNetwork {
@@ -152,7 +88,7 @@ export function parseWdutilOutput(output: string): WifiNetwork {
           networkInfo.ssid = value;
           break;
         case "BSSID":
-          networkInfo.bssid = normalizeMacAddress(value);
+          networkInfo.bssid = value;
           break;
         case "RSSI":
           networkInfo.rssi = parseInt(value.split(" ")[0]);
@@ -186,125 +122,62 @@ export function parseWdutilOutput(output: string): WifiNetwork {
   return networkInfo;
 }
 
-/**
- * Parses the output of the `netsh wlan show interfaces` command.
- *
- * The reason why it relies on the presence of the "Wi-Fi" line and ordering of the lines
- * is because the output is localized in the language of the system. The alternative would be
- * to maintain a language-specific parser for each language.
- */
 export function parseNetshOutput(output: string): WifiNetwork {
   const networkInfo = getDefaultWifiNetwork();
-  const lines = output.split("\n").map((line) => line.trim());
 
-  // Find the Wi-Fi interface section
-  const wifiLineIndex = lines.findIndex((line) => line.includes("Wi-Fi"));
-  if (wifiLineIndex === -1) return networkInfo;
+  const lines = output.split("\n");
 
-  // Find SSID and BSSID lines as they are consistent markers
-  const ssidLineIndex = lines.findIndex(
-    (line, index) =>
-      index > wifiLineIndex && line.includes("SSID") && !line.includes("BSSID")
-  );
-  if (ssidLineIndex === -1) return networkInfo;
+  let SSID = "";
+  let BSSID = "";
+  let Signal = "";
+  let Channel = "";
+  let Authentication = "";
+  let TR = "";
+  let phyMode = "";
 
-  const bssidLineIndex = lines.findIndex(
-    (line, index) => index > wifiLineIndex && line.includes("BSSID")
-  );
-  if (bssidLineIndex === -1) return networkInfo;
-
-  // Parse values based on their position relative to BSSID line
-  const getValue = (line: string): string => {
-    const colonIndex = line.indexOf(":");
-    return colonIndex !== -1 ? line.substring(colonIndex + 1).trim() : "";
-  };
-
-  // SSID is always present and consistent
-  networkInfo.ssid = getValue(lines[ssidLineIndex]);
-
-  // BSSID is always present and consistent
-  networkInfo.bssid = normalizeMacAddress(getValue(lines[bssidLineIndex]));
-  if (!isValidMacAddress(networkInfo.bssid)) {
-    throw new Error(
-      "Invalid BSSID when parsing netsh output: " +
-        networkInfo.bssid +
-        ". Giving up as everything below relies on it order-wise."
-    );
-  }
-
-  // Radio type is 2 lines after BSSID
-  networkInfo.phyMode = getValue(lines[bssidLineIndex + 2]);
-
-  // Authentication is 3 lines after BSSID
-  networkInfo.security = getValue(lines[bssidLineIndex + 3]);
-
-  // Channel is 6 lines after BSSID
-  const channel = parseInt(getValue(lines[bssidLineIndex + 6]) || "0");
-  networkInfo.channel = channel;
-  networkInfo.frequency = channel > 14 ? 5 : 2.4;
-
-  // Transmit rate is 7 lines after BSSID
-  const txRate = getValue(lines[bssidLineIndex + 8]);
-  networkInfo.txRate = parseFloat(txRate.split(" ")[0]);
-
-  // Signal is 8 lines after BSSID
-  const signal = getValue(lines[bssidLineIndex + 9]);
-  networkInfo.signalStrength = parseInt(signal.replace("%", ""));
-
-  return networkInfo;
-}
-
-export function parseIwOutput(
-  linkOutput: string,
-  infoOutput: string
-): WifiNetwork {
-  const networkInfo = getDefaultWifiNetwork();
-
-  const linkLines = linkOutput.split("\n");
-  linkLines.forEach((line) => {
+  lines.forEach((line) => {
     const trimmedLine = line.trim();
-    if (trimmedLine.startsWith("SSID:")) {
-      networkInfo.ssid = trimmedLine.split("SSID:")[1]?.trim() || "";
-    } else if (trimmedLine.startsWith("Connected to")) {
-      networkInfo.bssid = normalizeMacAddress(
-        trimmedLine.split(" ")[2]?.trim() || ""
-      );
-    } else if (trimmedLine.startsWith("signal:")) {
-      const signalMatch = trimmedLine.match(/signal:\s*(-?\d+)\s*dBm/);
-      if (signalMatch) {
-        networkInfo.rssi = parseInt(signalMatch[1]);
-      }
-    } else if (trimmedLine.startsWith("freq:")) {
-      const freqMatch = trimmedLine.match(/freq:\s*(\d+)/);
-      if (freqMatch) {
-        const freqMhz = parseInt(freqMatch[1]);
-        networkInfo.frequency = Math.round((freqMhz / 1000) * 100) / 100; // Convert MHz to GHz with 2 decimal places
-      }
-    } else if (trimmedLine.startsWith("tx bitrate:")) {
-      const txRate = trimmedLine.split("tx bitrate:")[1]?.trim() || "";
-      networkInfo.txRate = parseFloat(txRate.split(" ")[0]);
-    } else if (trimmedLine.includes("width:")) {
-      const width = trimmedLine.split("width:")[1]?.trim() || "";
-      networkInfo.channelWidth = parseInt(width.split(" ")[0]);
+
+    if (trimmedLine.startsWith("Name")) {
+      SSID = "SSID";
+      BSSID = "BSSID";
+      Signal = "Signal";
+      Channel = "Channel";
+      Authentication = "Authentication";
+      TR = "Transmit rate (Mbps)";
+      phyMode = "Radio Type";
+    } else if (trimmedLine.startsWith("Nome")) {
+      SSID = "SSID";
+      BSSID = "BSSID";
+      Signal = "Segnale";
+      Channel = "Canale";
+      Authentication = "Autenticazione";
+      TR = "Velocità trasmissione (Mbps)";
+      phyMode = "Tipo frequenza radio";
     }
   });
 
-  const infoLines = infoOutput.split("\n");
-  infoLines.forEach((line) => {
+  lines.forEach((line) => {
     const trimmedLine = line.trim();
-    if (trimmedLine.startsWith("channel")) {
-      const channelMatch = trimmedLine.match(
-        /channel\s+(\d+)\s+\((\d+)\s*MHz\),\s*width:\s*(\d+)\s*MHz/
-      );
-      if (channelMatch) {
-        networkInfo.channel = parseInt(channelMatch[1]);
-        // Update frequency if not already set from linkOutput
-        if (!networkInfo.frequency) {
-          const freqMhz = parseInt(channelMatch[2]);
-          networkInfo.frequency = Math.round((freqMhz / 1000) * 100) / 100;
-        }
-        networkInfo.channelWidth = parseInt(channelMatch[3]);
-      }
+    if (trimmedLine.startsWith(SSID)) {
+      networkInfo.ssid = trimmedLine.split(":")[1]?.trim() || "";
+    } else if (trimmedLine.startsWith(BSSID)) {
+      const colonIndex = trimmedLine.indexOf(":");
+      networkInfo.bssid = trimmedLine.substring(colonIndex + 1).trim();
+    } else if (trimmedLine.startsWith(Signal)) {
+      const signal = trimmedLine.split(":")[1]?.trim() || "";
+      networkInfo.rssi = parseInt(signal.replace("%", ""));
+    } else if (trimmedLine.startsWith(Channel)) {
+      const channel = parseInt(trimmedLine.split(":")[1]?.trim() || "0");
+      networkInfo.channel = channel;
+      networkInfo.frequency = channel > 14 ? 5 : 2.4;
+    } else if (trimmedLine.startsWith(phyMode)) {
+      networkInfo.phyMode = trimmedLine.split(":")[1]?.trim() || "";
+    } else if (trimmedLine.startsWith(Authentication)) {
+      networkInfo.security = trimmedLine.split(":")[1]?.trim() || "";
+    } else if (trimmedLine.startsWith(TR)) {
+      const rate = trimmedLine.split(":")[1]?.trim() || "";
+      networkInfo.txRate = parseFloat(rate.split(" ")[0]);
     }
   });
 
